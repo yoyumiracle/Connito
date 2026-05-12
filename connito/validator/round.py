@@ -383,9 +383,10 @@ class Round:
                 )
 
                 # Tail: every miner with a chain checkpoint that did not
-                # land in this round's A/B/C roster. Appended to
-                # background_uids (after the consensus tier) so they
-                # still get downloaded + evaluated when there is spare
+                # land in this round's A/B/C roster or the prev-round
+                # A/B carry-over tier. Appended to background_uids
+                # (after the consensus + carry-over tiers) so it still
+                # gets downloaded + evaluated when there is spare
                 # capacity. Ordered staleness-first (longest-since-last
                 # evaluated), random tiebreak so equal-staleness UIDs
                 # rotate naturally across cycles.
@@ -395,18 +396,48 @@ class Round:
                     | set(new_validation_c)
                 )
                 cohort_set = abc_set | set(foreground_uids)
+
+                # Carry-over: re-evaluate last round's Group A and B in
+                # this round's background. Within a cohort epoch A/B
+                # are unchanged, so this dedupes to a no-op. At a
+                # cohort boundary the input `cohort_state` still holds
+                # the *previous* epoch's groups (advancement happens
+                # inside `maybe_advance_cohort` above and returns a new
+                # object), so those UIDs get one more eval pass before
+                # rotating out — the handoff does not drop their scores.
+                prev_ab_pool: list[int] = []
+                if cohort_state is not None:
+                    _seen_prev: set[int] = set()
+                    for uid in (
+                        *cohort_state.validation_group_a,
+                        *cohort_state.validation_group_b,
+                    ):
+                        if uid in cohort_set or uid in _seen_prev:
+                            continue
+                        _seen_prev.add(uid)
+                        prev_ab_pool.append(uid)
+                prev_ab_set = set(prev_ab_pool)
+
                 tail_pool: list[int] = []
                 _seen_tail: set[int] = set()
                 for uid in (*foreground, *background):
-                    if uid in cohort_set or uid in _seen_tail:
+                    if (
+                        uid in cohort_set
+                        or uid in prev_ab_set
+                        or uid in _seen_tail
+                    ):
                         continue
                     _seen_tail.add(uid)
                     tail_pool.append(uid)
                 tail_pool.sort(
                     key=lambda u: (last_eval_map.get(u, EPOCH), random.random())
                 )
-                if tail_pool:
-                    background_uids = tuple([*background_uids, *tail_pool])
+                if prev_ab_pool or tail_pool:
+                    background_uids = tuple([
+                        *background_uids,
+                        *prev_ab_pool,
+                        *tail_pool,
+                    ])
 
                 # Make sure every UID in the new roster has a hotkey
                 # entry — Group A and B may include UIDs outside this
@@ -428,6 +459,7 @@ class Round:
                     validation_group_c=list(new_validation_c),
                     foreground_uids=list(foreground_uids),
                     background_uids=list(background_uids),
+                    prev_ab_carryover=list(prev_ab_pool),
                     tail_uids=list(tail_pool),
                     weight_group_1=list(new_weight_group_1),
                     weight_group_2=list(new_weight_group_2),

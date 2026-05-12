@@ -396,3 +396,93 @@ def test_flag_on_with_missing_cycle_index_falls_back_to_legacy():
     assert r.validation_group_a == ()
     assert r.weight_group_1 == ()
     assert r.cohort_state is None
+
+
+def test_flag_on_carries_over_prev_round_group_ab_into_background():
+    """Last round's Group A and B (from the input cohort_state) get
+    re-evaluated in this round's background — appended after the new
+    cohort's (A∪B∪C)\\foreground roster and deduped against it."""
+    n = 30
+    metagraph = _metagraph(
+        n_total=n,
+        validator_hotkeys=["vme"],
+        miner_hotkeys=[f"m{i}" for i in range(1, n)],
+    )
+    config = _config(flag=True)
+    # Foreground = m20..m29. Pick prev-A/B UIDs from the m1..m19 range
+    # so they cannot land in foreground; the no-weight metagraph also
+    # leaves chain-consensus A/B empty, so the carry-over tier is the
+    # only path that can place these UIDs in the roster.
+    assignment = {"vme": [f"m{i}" for i in range(20, n)]}
+    miners = [f"m{i}" for i in range(1, n)]
+
+    held = CohortState(
+        cohort_epoch=0,
+        expert_group="1",
+        validation_group_a=(1, 2, 3),
+        validation_group_b=(4, 5),
+        validation_group_c=tuple(range(20, 30)),
+        highest_seen_cycle_index=7,
+    )
+
+    r = _freeze(
+        config=config,
+        metagraph=metagraph,
+        assignment=assignment,
+        miners_with_checkpoint=miners,
+        cohort_state=held,
+        cycle_index=8,        # boundary
+        cycle_length=100,
+        round_id=800,
+    )
+
+    new_roster = (
+        set(r.validation_group_a)
+        | set(r.validation_group_b)
+        | set(r.validation_group_c)
+        | set(r.foreground_uids)
+    )
+    expected_carryover = {uid for uid in (1, 2, 3, 4, 5) if uid not in new_roster}
+    # Sanity: the fixture must actually exercise the carry-over path —
+    # if the new cohort swallowed every prev-A/B UID, the assertion
+    # below would pass vacuously and the test would be worthless.
+    assert expected_carryover, (
+        "test fixture failed to leave any prev-A/B UID outside the new "
+        "cohort roster; cannot verify carry-over"
+    )
+    bg = list(r.background_uids)
+    for uid in expected_carryover:
+        assert uid in bg, (
+            f"prev-A/B uid {uid} missing from background_uids "
+            f"(new_roster={sorted(new_roster)}, bg={bg})"
+        )
+
+
+def test_flag_on_carry_over_is_noop_when_cohort_state_is_none():
+    """Cold start: cohort_state=None → no carry-over tier, background
+    matches the legacy (A∪B∪C)\\foreground + tail composition."""
+    n = 20
+    metagraph = _metagraph(
+        n_total=n,
+        validator_hotkeys=["vme"],
+        miner_hotkeys=[f"m{i}" for i in range(1, n)],
+    )
+    config = _config(flag=True)
+    assignment = {"vme": [f"m{i}" for i in range(10, n)]}
+    miners = [f"m{i}" for i in range(1, n)]
+
+    r = _freeze(
+        config=config,
+        metagraph=metagraph,
+        assignment=assignment,
+        miners_with_checkpoint=miners,
+        cohort_state=None,
+        cycle_index=8,
+        cycle_length=100,
+        round_id=800,
+    )
+
+    # Roster still covers the full miner population — no UIDs lost
+    # because the carry-over tier was skipped.
+    roster = set(r.foreground_uids) | set(r.background_uids)
+    assert roster.issuperset(set(range(1, n)))

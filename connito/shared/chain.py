@@ -413,8 +413,8 @@ def _submit_fallback_weights(
     config: WorkerConfig,
     wallet: bittensor.Wallet,
     subtensor: bittensor.Subtensor,
-    wait_for_inclusion: bool = False,
-    wait_for_finalization: bool = False,
+    wait_for_inclusion: bool = True,
+    wait_for_finalization: bool = True,
 ) -> bool:
     """Try previous weights from chain, otherwise submit uniform weights.
 
@@ -526,8 +526,8 @@ async def _asubmit_fallback_weights(
     config: WorkerConfig,
     wallet: bittensor.Wallet,
     async_subtensor: "bittensor.AsyncSubtensor",
-    wait_for_inclusion: bool = False,
-    wait_for_finalization: bool = False,
+    wait_for_inclusion: bool = True,
+    wait_for_finalization: bool = True,
 ) -> bool:
     """Async equivalent of `_submit_fallback_weights`."""
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402
@@ -619,8 +619,8 @@ def submit_weights(
     uid_weights: dict[str, float],
     normalize: bool = True,
     top_k: int | None = None,
-    wait_for_inclusion: bool = False,
-    wait_for_finalization: bool = False,
+    wait_for_inclusion: bool = True,
+    wait_for_finalization: bool = True,
 ) -> bool:
     """
     Submit weights to the chain for this subnet.
@@ -769,8 +769,8 @@ async def submit_weights_async(
     uid_weights: dict[int | str, float],
     normalize: bool = True,
     top_k: int | None = None,
-    wait_for_inclusion: bool = False,
-    wait_for_finalization: bool = False,
+    wait_for_inclusion: bool = True,
+    wait_for_finalization: bool = True,
 ) -> bool:
     """Async equivalent of `submit_weights` for use against an AsyncSubtensor.
 

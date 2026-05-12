@@ -235,10 +235,22 @@ def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
 
 
 def _install_signal_logging() -> None:
-    """Log SIGTERM / SIGINT / SIGHUP on receipt so docker-initiated kills are
-    visible in the validator log. We re-raise the default handler after logging
-    (default for SIGTERM/SIGHUP is to exit; SIGINT raises KeyboardInterrupt)
-    so the existing shutdown paths in run() still execute.
+    """Funnel SIGTERM / SIGHUP into the same `KeyboardInterrupt` path SIGINT
+    already takes, so docker-initiated stops run the existing shutdown block
+    in `run()` (background workers, chain_submitter, poller, averagers, …).
+
+    The previous implementation restored `SIG_DFL` and re-raised the signal.
+    For SIGTERM that meant "terminate immediately" with no Python exception —
+    the `except KeyboardInterrupt` / `except Exception` arms in `run()` never
+    fired, so nothing was stopped cleanly. Watchtower then timed out after 120s
+    and dockerd was left with a zombie PID 1 (orphaned hivemind libp2p +
+    background-worker threads, no init to reap them) which couldn't be removed.
+    Raising `KeyboardInterrupt` reuses the SIGINT shutdown path verbatim.
+
+    Caveat: if the main thread is parked inside a C extension when the signal
+    arrives (hivemind averager step, a torch op, etc.), the exception only
+    propagates once control returns to Python. The shutdown block itself still
+    needs per-step time bounds for that, but those are separate work.
     """
     def _handler(signum: int, frame) -> None:
         try:
@@ -246,13 +258,11 @@ def _install_signal_logging() -> None:
         except (ValueError, KeyError):
             name = str(signum)
         logger.warning(
-            "Validator received signal — process is being asked to stop",
+            "Validator received signal — initiating shutdown",
             signal=name,
             signum=signum,
         )
-        # Restore the default handler and re-raise so normal shutdown happens.
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        raise KeyboardInterrupt
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
         try:
@@ -325,10 +335,16 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    # global_model: partial model (only assigned experts) — used for optimization and evaluation
+    # global_model: partial model (only assigned experts) — used for optimization and evaluation.
+    # `load_global_checkpoint=False`: the validator boots from the pretrained
+    # backbone + experts (`get_base_model`) without overlaying any on-disk
+    # expert state. Peer-resync via `reload_model_inplace` still pulls the
+    # current pool state in the round loop; the optimizer/scaler/dataloader
+    # resume below is also independent of this flag.
     global_model, model_meta = load_model(
         rank, config, expert_manager, subtensor, wallet, current_model_meta,
         partial=True, checkpoint_device=device,
+        load_global_checkpoint=False,
     )
 
     # === optimizers ===
@@ -723,12 +739,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # default that won't change cross-validator behavior.
     score_history_window: int = 80
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.31":
-        # One-time wipe: drop any prior aggregator state on disk so the v0.1.31
+    if pkg_version == "v0.2.3":
+        # One-time wipe: drop any prior aggregator state on disk so the v0.2.3
         # rollout starts every validator with a clean score history. Subsequent
-        # restarts on v0.1.31 fall through the `score_path.exists()` branch and
+        # restarts on v0.2.3 fall through the `score_path.exists()` branch and
         # load whatever this version has persisted.
-        logger.info("Clearing historic score_aggregator for v0.1.31", pkg_version=pkg_version)
+        logger.info("Clearing historic score_aggregator for v0.2.3", pkg_version=pkg_version)
         score_path.unlink(missing_ok=True)
         score_aggregator = MinerScoreAggregator(
             max_points=score_window,

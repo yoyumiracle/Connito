@@ -46,8 +46,8 @@ class ChainSubmitter:
         *,
         normalize: bool = True,
         top_k: int | None = None,
-        wait_for_inclusion: bool = False,
-        wait_for_finalization: bool = False,
+        wait_for_inclusion: bool = True,
+        wait_for_finalization: bool = True,
         post_submit_delay_s: float = 14.0,
         runner_name: str = "connito-validator-chain-submitter",
     ) -> None:

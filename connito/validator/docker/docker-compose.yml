@@ -27,6 +27,16 @@ services:
     restart: unless-stopped
     pull_policy: always
 
+    # tini as PID 1 (docker --init). Forwards signals to the validator and
+    # reaps zombie children inside the container — hivemind spawns a libp2p
+    # daemon and the DHT loop as separate subprocesses, and bittensor opens
+    # its own websocket threads. Without tini, if the validator dies before
+    # cleaning these up the container's PID 1 is left as a zombie that
+    # dockerd refuses to remove (seen as Watchtower's "PID … is zombie and
+    # can not be killed" failure mode). Safety net in case shutdown
+    # regresses; not a replacement for graceful shutdown in run.py.
+    init: true
+
     # Local development build. Production deploys pull from the registry
     # and ignore this section, but `docker compose build` from this dir
     # will rebuild the image against the live source tree.

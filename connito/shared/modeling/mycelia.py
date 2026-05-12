@@ -30,6 +30,8 @@ if MODEL_BACKEND == "deepseek_v2":
     from connito.shared.modeling.custom_deepseek_v2_lite import (
         CustomDeekSeekMoE as _CausalLMClass,
         get_moe_model_config as _get_moe_model_config_impl,
+        stream_pretrained_state_dict_to_partial_model as _stream_pretrained_to_partial_impl,
+        stream_safetensors_to_partial_model as _stream_safetensors_to_partial_impl,
     )
 
     def get_moe_model_config(config, topk, group_ids, expert_manager, full = False):
@@ -40,6 +42,11 @@ elif MODEL_BACKEND == "qwen3_next":
         CustomQwen3NextForCausalLM as _CausalLMClass,
         get_moe_model_config as _get_moe_model_config_impl,
     )
+    # qwen3_next backend has no full→partial streaming helper yet;
+    # `get_base_model(partial=True)` falls back to random init for this
+    # backend until one is added.
+    _stream_pretrained_to_partial_impl = None
+    _stream_safetensors_to_partial_impl = None
 
     def get_moe_model_config(config, topk, group_ids, expert_manager):
         return _get_moe_model_config_impl(config, topk, group_ids, expert_manager)
@@ -53,16 +60,29 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------
 # Loading helpers
 # ---------------------------------------------------------------------
-def load_pretrained_state_dict(model_path: str) -> dict[str, torch.Tensor]:
-    """Load pretrained state dict from a HuggingFace model path (local or hub)."""
+def load_pretrained_state_dict(
+    model_path: str,
+    dtype: torch.dtype = torch.float32,
+) -> dict[str, torch.Tensor]:
+    """Load pretrained state dict from a HuggingFace model path (local or hub).
+
+    `dtype` selects the load-time tensor dtype. Default fp32 preserves
+    historical behavior; callers under memory pressure (e.g. the partial
+    loading path) should pass `torch.float16` / `torch.bfloat16` to halve
+    the host RAM footprint of the transient state dict."""
     from transformers import AutoModelForCausalLM
 
     hf_model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.float32, low_cpu_mem_usage=True,
+        model_path, torch_dtype=dtype, low_cpu_mem_usage=True,
     )
     state_dict = hf_model.state_dict()
     del hf_model
-    logger.debug("Loaded pretrained state dict", path=model_path, num_keys=len(state_dict))
+    logger.debug(
+        "Loaded pretrained state dict",
+        path=model_path,
+        num_keys=len(state_dict),
+        dtype=str(dtype),
+    )
     return state_dict
 
 
@@ -78,9 +98,12 @@ def load_pretrained_model_low_mem(
             "Using direct explicit state_dict load for full model to avoid meta-tensor finalize issues",
             path=model_path,
         )
-        model = model_class(moe_config)
-        pretrained_sd = load_pretrained_state_dict(model_path)
+        # Build at `model_dtype` from the start: a fp32 default + later
+        # cast would peak at ~2x the final size for a 15B-param model.
+        model = model_class(moe_config).to(dtype=model_dtype)
+        pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
         model.load_state_dict(pretrained_sd, strict=False)
+        del pretrained_sd
         logger.info("Loaded full model via explicit state_dict", path=model_path, dtype=str(model_dtype))
         return model
 
@@ -107,9 +130,10 @@ def load_pretrained_model_low_mem(
         del model
         gc.collect()
 
-        model = model_class(moe_config)
-        pretrained_sd = load_pretrained_state_dict(model_path)
+        model = model_class(moe_config).to(dtype=model_dtype)
+        pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
         model.load_state_dict(pretrained_sd, strict=False)
+        del pretrained_sd
 
     logger.info("Loaded pretrained model directly", path=model_path, dtype=str(model_dtype))
     return model
@@ -201,7 +225,86 @@ def get_base_model(
             model_dtype=model_dtype,
         )
     else:
+        # Partial path: a bare `_CausalLMClass(moe_config)` would leave every
+        # parameter at its random `_init_weights` default. Downstream
+        # `load_checkpoint` only restores the active expert group, so the
+        # backbone / embeddings / lm_head / attention / dense MLPs / shared
+        # experts would all stay random.
+        #
+        # Strategy (keeps peak memory bounded for DeepSeek-V2-Lite — the
+        # earlier "build full model on CPU + convert" approach peaked at
+        # ~76 GB host RAM):
+        #   1. Build the partial model and move it to its target device
+        #      (typically GPU) at `model_dtype` before any pretrained data
+        #      is loaded. Partial parameters live in VRAM; host RAM for
+        #      the partial model returns to 0.
+        #   2. Open each safetensors shard directly via `safe_open` and
+        #      stream one tensor at a time into the partial model,
+        #      slicing owned experts in the same per-key pass. The full
+        #      state dict is never materialized in CPU RAM, so host RAM
+        #      stays bounded by a single shard's file-backed mmap
+        #      (~6 GB) plus one materialized tensor.
+        #   3. Fall back to `load_pretrained_state_dict` + in-RAM
+        #      streaming only if the safetensors-direct path is not
+        #      available for the current backend.
+        target_device = getattr(config.model, "device", "cpu")
+        if target_device == "cuda" and not torch.cuda.is_available():
+            logger.warning(
+                "config.model.device='cuda' but CUDA not available; keeping partial model on CPU",
+            )
+            target_device = "cpu"
+
         model = _CausalLMClass(moe_config)
+        if _stream_safetensors_to_partial_impl is not None and group_ids:
+            target_group = group_ids[0]
+            model = model.to(device=target_device, dtype=model_dtype)
+            model = _stream_safetensors_to_partial_impl(
+                partial_model=model,
+                model_path=config.model.model_path,
+                expert_group_assignment=expert_manager.expert_group_assignment,
+                target_group=target_group,
+                dtype=model_dtype,
+            )
+            gc.collect()
+            logger.info(
+                "Streamed pretrained safetensors directly into partial model",
+                target_group=target_group,
+                device=str(target_device),
+                dtype=str(model_dtype),
+            )
+        elif _stream_pretrained_to_partial_impl is not None and group_ids:
+            # Backend has a state-dict streaming helper but no
+            # safetensors-direct path. Higher CPU peak (~30 GB for
+            # DeepSeek-V2-Lite) but still better than the legacy
+            # full-model-on-CPU approach.
+            target_group = group_ids[0]
+            model = model.to(device=target_device, dtype=model_dtype)
+            pretrained_sd = load_pretrained_state_dict(
+                config.model.model_path, dtype=model_dtype,
+            )
+            try:
+                model = _stream_pretrained_to_partial_impl(
+                    partial_model=model,
+                    state_dict=pretrained_sd,
+                    expert_group_assignment=expert_manager.expert_group_assignment,
+                    target_group=target_group,
+                )
+            finally:
+                del pretrained_sd
+                gc.collect()
+            logger.info(
+                "Streamed pretrained backbone + owned-expert slices into partial model",
+                target_group=target_group,
+                device=str(target_device),
+                dtype=str(model_dtype),
+            )
+        else:
+            logger.warning(
+                "Partial model returned with random weights — no pretrained-state-dict "
+                "streaming helper available for this backend or `group_ids` missing",
+                backend=MODEL_BACKEND,
+                group_ids=group_ids,
+            )
 
     if model is not None and get_nested_attr(config, "model.torch_compile", False):
         model = torch.compile(model)
