@@ -12,6 +12,6 @@ data:
   per_device_train_batch_size: 1
   batch_size: 4
   sequence_length: 4096
-  world_size: 10 # TODO: approximately how many miners are out there
-  rank: 1 # TODO: based on your uid
+  world_size: 1 # TODO: approximately how many miners are out there
+  rank: 0 # TODO: based on your uid
   dataset_class: "expert_groups.exp_math.dataset:StreamingTorchDataset"
