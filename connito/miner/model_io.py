@@ -24,7 +24,12 @@ from connito.shared.checkpoints import (
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.config import MinerConfig, parse_args
 from connito.shared.chain import setup_chain_worker
-from connito.shared.cycle import PhaseResponse, check_phase_expired, wait_till
+from connito.shared.cycle import (
+    PhaseResponse,
+    check_phase_expired,
+    get_validator_whitelist_from_api,
+    wait_till,
+)
 from connito.shared.hf_distribute import (
     get_hf_upload_readiness,
     resolve_hf_repo_ids,
@@ -118,6 +123,55 @@ def scheduler_service(
         )
 
 
+# Number of top-staked whitelisted validators to consider for model download.
+# Filtering down to the top stake-holders concentrates the miner's training on
+# whichever validator's vote actually moves consensus, while still keeping a few
+# fallbacks in case the top validator's HF download fails this cycle.
+TOP_STAKED_VALIDATOR_COUNT = 3
+
+
+def _resolve_top_staked_validator_hotkeys(
+    subtensor: bittensor.Subtensor,
+    config,
+    top_n: int = TOP_STAKED_VALIDATOR_COUNT,
+) -> set[str] | None:
+    """Return the hotkeys of the top-N whitelisted validators by stake.
+
+    Returns None when the whitelist is unavailable (degraded mode) so the
+    caller falls open and applies no extra filtering.
+    """
+    whitelist = get_validator_whitelist_from_api(config)
+    if not whitelist:
+        logger.warning(
+            "Validator whitelist unavailable; skipping top-staked validator filter"
+        )
+        return None
+    try:
+        mg = subtensor.metagraph(netuid=config.chain.netuid, lite=True)
+    except Exception as e:
+        logger.warning("Could not load metagraph for top-staked filter", error=str(e))
+        return None
+    ranked: list[tuple[str, float]] = []
+    for uid, hotkey in enumerate(mg.hotkeys):
+        if hotkey in whitelist:
+            try:
+                stake = float(mg.S[uid])
+            except (IndexError, TypeError):
+                continue
+            ranked.append((hotkey, stake))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda kv: -kv[1])
+    chosen = {hk for hk, _ in ranked[:top_n]}
+    logger.info(
+        "Restricting fetch to top-staked validators",
+        top_n=top_n,
+        chosen_count=len(chosen),
+        top_stakes=[round(s, 2) for _, s in ranked[:top_n]],
+    )
+    return chosen
+
+
 # --- Workers ---
 def download_worker(
     config,
@@ -151,13 +205,15 @@ def download_worker(
             if current_model_meta is not None:
                 current_model_meta.model_hash = current_model_hash
 
+            allowed_hotkeys = _resolve_top_staked_validator_hotkeys(subtensor, config)
             chain_checkpoint = fetch_model_from_chain_validator(
                 current_model_meta,
                 config,
                 subtensor,
                 wallet,
                 expert_group_ids=[config.task.exp.group_id],
-                expert_group_assignment = expert_manager.expert_group_assignment
+                expert_group_assignment=expert_manager.expert_group_assignment,
+                allowed_hotkeys=allowed_hotkeys,
             )
 
             if (
