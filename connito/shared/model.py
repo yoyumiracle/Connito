@@ -48,6 +48,11 @@ def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int
     targets: list[tuple[int | str, str]] = []
     for expert_group_id in expert_group_ids:
         if isinstance(expert_group_id, int):
+            # `.safetensors` is the new default (PR #98); `.pt` kept as legacy
+            # fallback during the migration window. `download_checkpoint_from_hf`
+            # tolerates per-file `EntryNotFoundError` so requesting both is safe
+            # when the repo only has one.
+            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.safetensors"))
             targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
         elif expert_group_id == "shared":
             # `model_shared` is no longer persisted or distributed; backbone state

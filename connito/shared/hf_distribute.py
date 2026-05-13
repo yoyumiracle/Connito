@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from huggingface_hub import HfApi, hf_hub_download
-from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
+from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError, RepositoryNotFoundError
 
 from connito.shared.app_logging import structlog
 
@@ -181,26 +181,41 @@ def download_checkpoint_from_hf(
     resolved_token = _resolve_token(token, token_env_var)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
+    fetched: list[str] = []
+    missing: list[str] = []
     try:
         for fname in filenames:
-            hf_hub_download(
-                repo_id=repo_id,
-                revision=revision,
-                filename=fname,
-                local_dir=str(dest_dir),
-                token=resolved_token,
-                etag_timeout=_HF_ETAG_TIMEOUT_SEC,
-            )
+            try:
+                hf_hub_download(
+                    repo_id=repo_id,
+                    revision=revision,
+                    filename=fname,
+                    local_dir=str(dest_dir),
+                    token=resolved_token,
+                    etag_timeout=_HF_ETAG_TIMEOUT_SEC,
+                )
+                fetched.append(fname)
+            except EntryNotFoundError:
+                # Caller passes both `.safetensors` and `.pt` variants per
+                # expert group during the format migration; tolerate the
+                # absent variant and require at least one sibling to land.
+                missing.append(fname)
     except RepositoryNotFoundError as e:
         raise RuntimeError(
             f"HF repo not found or unauthorized: {repo_id}@{revision}"
         ) from e
 
+    if not fetched:
+        raise RuntimeError(
+            f"No requested files present on HF {repo_id}@{revision}: missing={missing}"
+        )
+
     logger.debug(
         "Downloaded checkpoint from HF",
         repo_id=repo_id,
         revision=revision,
-        files=filenames,
+        files=fetched,
+        missing=missing,
         dest_dir=str(dest_dir),
     )
     return dest_dir
