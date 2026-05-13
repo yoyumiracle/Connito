@@ -28,7 +28,6 @@ from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
 from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeout
 from connito.shared.cycle import (
     PhaseNames,
-    get_allowed_version_range,
     get_blocks_from_previous_phase_from_api,
     get_validator_seed_from_commit,
 )
@@ -49,7 +48,7 @@ def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int
     targets: list[tuple[int | str, str]] = []
     for expert_group_id in expert_group_ids:
         if isinstance(expert_group_id, int):
-            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.safetensors"))
+            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
         elif expert_group_id == "shared":
             # `model_shared` is no longer persisted or distributed; backbone state
             # is reconstructed from `config.model.model_path` at instantiation.
@@ -66,34 +65,6 @@ def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int
 def _clear_download_targets(out_folder: Path, filenames: list[str]) -> None:
     for filename in filenames:
         (out_folder / filename).unlink(missing_ok=True)
-
-
-def _cleanup_empty_download_folder(out_folder: Path, filenames: list[str]) -> None:
-    """Remove the download folder if none of the target shards landed.
-
-    Without this, a failed download (e.g. EntryNotFoundError, timeout) leaves
-    an empty `…_globalver_<N>/` behind that select_best_checkpoint will later
-    treat as a valid local checkpoint, blocking re-download via the freshness
-    filter.
-    """
-    if not out_folder.exists():
-        return
-    if any((out_folder / fname).exists() for fname in filenames):
-        return
-    try:
-        import shutil
-
-        shutil.rmtree(out_folder, ignore_errors=True)
-        logger.info(
-            "Removed empty download folder after failed fetch",
-            out_folder=str(out_folder),
-        )
-    except Exception as e:
-        logger.warning(
-            "Could not remove empty download folder",
-            out_folder=str(out_folder),
-            error=str(e),
-        )
 
 
 def _download_checkpoint_from_hf_with_timeout(
@@ -359,45 +330,14 @@ def fetch_model_from_chain_validator(
             if ckpt.hotkey is not None and ckpt.hotkey in allowed_hotkeys
         ]
         dropped = before - len(kept)
-        if kept or before == 0:
-            if dropped:
-                logger.info(
-                    "fetch_model_from_chain_validator: dropped checkpoints not in allowed_hotkeys",
-                    dropped=dropped,
-                    kept=len(kept),
-                    allowed_hotkey_count=len(allowed_hotkeys),
-                )
-            chain_checkpoints = ChainCheckpoints(checkpoints=kept)
-        else:
-            # Filter would drop the only candidate the upstream majority-hash
-            # selection produced. This happens when our top-staked whitelist
-            # is disjoint from the validators that posted complete chain
-            # commits this cycle. Fall open so we get SOME model rather than
-            # locking on a stale local checkpoint.
-            logger.warning(
-                "fetch_model_from_chain_validator: allowed_hotkeys filter would drop everything; falling open",
-                available_count=before,
+        if dropped:
+            logger.info(
+                "fetch_model_from_chain_validator: dropped checkpoints not in allowed_hotkeys",
+                dropped=dropped,
+                kept=len(kept),
                 allowed_hotkey_count=len(allowed_hotkeys),
             )
-
-    # Rewrite global_ver=0 (validator's "merge failed" signal) to the current
-    # max_allowed_version. This unlocks two things on our side without lying
-    # upward: (1) the freshness comparison advances cycle over cycle, and
-    # (2) our published MinerChainCommit.global_ver lands inside the validators'
-    # version window so they don't drop us at Round.freeze.
-    _, _max_allowed_version = get_allowed_version_range(config)
-    if _max_allowed_version is not None:
-        rewritten = 0
-        for ckpt in chain_checkpoints.checkpoints:
-            if ckpt.global_ver == 0:
-                ckpt.global_ver = _max_allowed_version
-                rewritten += 1
-        if rewritten:
-            logger.info(
-                "fetch_model_from_chain_validator: rewrote global_ver=0 to max_allowed_version",
-                count=rewritten,
-                max_allowed_version=_max_allowed_version,
-            )
+        chain_checkpoints = ChainCheckpoints(checkpoints=kept)
 
     # --- Filter to only newer than current model ---
     if current_model_meta is not None:
@@ -468,7 +408,6 @@ def fetch_model_from_chain_validator(
                         hf_revision=chain_checkpoint.hf_revision,
                         timeout_sec=download_timeout_sec,
                     )
-                    _cleanup_empty_download_folder(out_folder, filenames)
                     continue
                 except Exception as e:
                     logger.warning(
@@ -480,7 +419,6 @@ def fetch_model_from_chain_validator(
                         error=str(e),
                         exc_info=True,
                     )
-                    _cleanup_empty_download_folder(out_folder, filenames)
                     continue
 
                 chain_checkpoint.path = out_folder
@@ -493,7 +431,6 @@ def fetch_model_from_chain_validator(
                         current_model_version=current_model_meta.global_ver if current_model_meta else None,
                         current_model_hash=current_model_meta.model_hash if current_model_meta else None,
                     )
-                    _cleanup_empty_download_folder(out_folder, filenames)
                     continue
 
                 download_success = True
