@@ -47,7 +47,7 @@ logger = structlog.get_logger(__name__)
 # wastes HF bandwidth and (more importantly) inflates the on-disk backlog
 # the cycle-tail prune has to tear down. Re-checked every poll so the cap
 # self-clears once eval drains the queue.
-DOWNLOAD_PENDING_EVAL_CAP = 10
+DOWNLOAD_PENDING_EVAL_CAP = 5
 
 
 class BackgroundDownloadWorker(threading.Thread):

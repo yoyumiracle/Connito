@@ -361,7 +361,7 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     archive_submissions: bool = False
     cleanup_stale_temporary_checkpoints: bool = True
     miner_submission_max_age_cycles: PositiveFloat = 1.5
-    miner_submission_archive_max_files: PositiveInt = 500
+    miner_submission_archive_max_files: PositiveInt = 5
 
 
 class DhtCfg(BaseConfig):

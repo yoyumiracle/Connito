@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from connito.shared.app_logging import structlog
 from connito.shared.checkpoint_helper import compile_full_state_dict_from_path
 from connito.shared.expert_manager import get_layer_expert_id
-from connito.shared.helper import get_model_hash, parse_dynamic_filename
+from connito.shared.helper import MINER_CHECKPOINT_SUFFIXES, get_model_hash, parse_dynamic_filename
 from connito.shared.schema import sign_message, verify_message
 
 from connito.shared.cycle import (
@@ -815,14 +815,19 @@ def prune_miner_submission_files(
     max_age_blocks = max(0, int(cycle_length * max_age_cycles))
     min_allowed_block = current_block - max_age_blocks
 
-    for file_path in folder_path.glob("*.pt"):
+    candidates = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in folder_path.glob(f"*{suffix}")
+    ]
+
+    for file_path in candidates:
         meta = parse_dynamic_filename(file_path.name)
         if "hotkey" not in meta or "block" not in meta:
             logger.warning("Skipping malformed submission filename", file=file_path.name)
             continue
 
     deleted_files: list[str] = []
-    for file_path in folder_path.glob("*.pt"):
+    for file_path in candidates:
         meta = parse_dynamic_filename(file_path.name)
         if "hotkey" not in meta or "block" not in meta:
             continue
@@ -900,7 +905,11 @@ def prune_submissions_outside_window(
 
     start, end = submission_block_range
     deleted_files: list[str] = []
-    for file_path in folder_path.glob("*.pt"):
+    candidates = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in folder_path.glob(f"*{suffix}")
+    ]
+    for file_path in candidates:
         if file_path.name.startswith(".tmp"):
             continue
         meta = parse_dynamic_filename(file_path.name)
@@ -943,7 +952,11 @@ def archive_top_miner_submissions(
 
     # Collect all submission files with their hotkey
     submissions: dict[str, Path] = {}
-    for file_path in submission_dir.glob("*.pt"):
+    submission_files = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in submission_dir.glob(f"*{suffix}")
+    ]
+    for file_path in submission_files:
         meta = parse_dynamic_filename(file_path.name)
         hotkey = meta.get("hotkey")
         if hotkey:
@@ -988,7 +1001,7 @@ def archive_top_miner_submissions(
             label = archive_hotkeys[hotkey]
             score_str = f"{hotkey_scores.get(hotkey, 0):.4f}"
             stem = file_path.stem
-            dest_name = f"{stem}_rank_{label}_loss_{score_str}.pt"
+            dest_name = f"{stem}_rank_{label}_loss_{score_str}{file_path.suffix}"
             dest = archive_dir / dest_name
             # bg-eval's _prune_non_top can delete this file between the
             # glob above and now (its per-round top-k disagrees with our
@@ -1009,7 +1022,11 @@ def archive_top_miner_submissions(
         logger.debug("Deleted non-archived miner submissions", count=len(deleted))
 
     # Prune archive to max_archive files (keep newest by modification time)
-    archive_files = sorted(archive_dir.glob("*.pt"), key=lambda f: f.stat().st_mtime, reverse=True)
+    archive_candidates = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in archive_dir.glob(f"*{suffix}")
+    ]
+    archive_files = sorted(archive_candidates, key=lambda f: f.stat().st_mtime, reverse=True)
     if len(archive_files) > max_archive:
         pruned = []
         for old_file in archive_files[max_archive:]:

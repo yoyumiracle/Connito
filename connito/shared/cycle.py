@@ -256,6 +256,13 @@ def wait_till(
 
     phase_response: PhaseResponse | None = None
     first_print = True
+    # Wall-clock anchor for the wait-heartbeat: every ~15 min of real time
+    # we emit a proof-of-life line via log_phase regardless of how the outer
+    # poll loop happens to slice its sleeps. Anchoring to monotonic() rather
+    # than per-iteration `slept` means short sleep_sec values (when the target
+    # is close) don't suppress the heartbeat.
+    heartbeat_interval = 900.0
+    last_heartbeat_at = time.monotonic()
     while True:
         ready, blocks_till, phase_response = should_act(config, phase_name, retry_blocks=poll_fallback_block)
         if ready is False and blocks_till > 0:
@@ -295,24 +302,34 @@ def wait_till(
                 f"at {expect_time.strftime('%H:%M:%S')}"
             )
         first_print = False
-        # Sleep in <=60 s slices and emit a heartbeat every ~5 min so the
-        # log doesn't go silent for long stretches inside a single sleep.
-        # Without this, a hang or external kill during the wait is invisible
-        # because the next "target" log only fires on the next iteration.
+        # Sleep in <=60 s slices so a heartbeat / external kill can be
+        # observed within ~60 s. Heartbeat emission is anchored to wall-clock
+        # (last_heartbeat_at, declared above the outer loop) so it fires on
+        # a 15-min cadence regardless of how the outer loop slices sleeps.
+        # Use log_phase (stdout, always visible) rather than logger.debug —
+        # operators watching the validator should see proof-of-life even
+        # when debug logs are filtered out.
         slept = 0.0
         slice_sec = 60.0
         while slept < sleep_sec:
             this_slice = min(slice_sec, sleep_sec - slept)
             time.sleep(this_slice)
             slept += this_slice
-            if slept % 300 < slice_sec and slept + slice_sec < sleep_sec:
-                logger.debug(
-                    "wait_till: heartbeat",
+            now = time.monotonic()
+            if now - last_heartbeat_at >= heartbeat_interval:
+                eta_str = ""
+                if phase_response is not None:
+                    eta = datetime.now() + timedelta(
+                        seconds=blocks_remaining * BITTENSOR_BLOCK_TIME_SECONDS
+                    )
+                    eta_str = f", target ~{eta.strftime('%H:%M:%S')}"
+                log_phase(
+                    f"<{phase_name}> wait heartbeat: {blocks_remaining} blocks remaining"
+                    f"{eta_str}",
                     phase_name=phase_name,
                     block_offset=block_offset,
-                    slept_sec=int(slept),
-                    sleep_sec=int(sleep_sec),
                 )
+                last_heartbeat_at = now
 
     if phase_response is None:
         logger.warning(
