@@ -319,8 +319,15 @@ def fetch_model_from_chain_validator(
         logger.warning("Could not resolve SN owner hotkey", error=str(e))
         owner_hotkey = None
 
+    # version_range_cycles=1 narrows the pool to this-cycle validator commits
+    # only. With the default of 3, stale-but-staked validator commits from
+    # prior cycles can pull the stake-weighted majority hash backwards in
+    # time; tightening to one cycle on the miner-download path makes the
+    # consensus reflect current-cycle merge participants. The validator's
+    # own paths still use the default (config.cycle.version_range_cycles).
     chain_checkpoints = build_chain_checkpoints_from_previous_phase(
-        config=config, subtensor=subtensor, for_role="validator", owner_hotkey=owner_hotkey
+        config=config, subtensor=subtensor, for_role="validator", owner_hotkey=owner_hotkey,
+        version_range_cycles=1,
     )
 
     if allowed_hotkeys is not None:
@@ -361,8 +368,18 @@ def fetch_model_from_chain_validator(
         max_retries = 2
         retry_delay_s = 10
 
+        # Try candidates freshest-first: highest global_ver, tie-break on stake.
+        # After the stake-weighted majority-hash filter all survivors share a
+        # model_hash, but the global_ver can still differ within the version
+        # window; prefer the most recent so we don't anchor training on a
+        # cycle-old anchor when a fresher peer is available.
+        ordered_candidates = sorted(
+            chain_checkpoints.checkpoints,
+            key=lambda c: (c.global_ver or 0, c.stake or 0.0),
+            reverse=True,
+        )
         while (not download_success) and (retries < max_retries):
-            for chain_checkpoint in chain_checkpoints.checkpoints:
+            for chain_checkpoint in ordered_candidates:
                 logger.info(f"Downloading from chain: uid = {chain_checkpoint.uid}", chain_checkpoint=chain_checkpoint)
 
                 out_folder = Path(config.ckpt.validator_checkpoint_path) / (

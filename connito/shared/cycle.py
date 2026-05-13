@@ -708,24 +708,35 @@ def get_validator_whitelist_from_api(config) -> set[str]:
     except (ValueError, TypeError) as e:
         logger.exception("Invalid JSON from %s: %s", url, e)
         return set()
-def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | None]:
+def get_allowed_version_range(
+    config: WorkerConfig,
+    version_range_cycles: int | None = None,
+) -> tuple[int | None, int | None]:
     """
     Return (min_allowed_version, max_allowed_version) for global_ver filtering.
 
     max_allowed_version: start block of the most recent MinerCommit1 phase.
-    min_allowed_version: max_allowed_version - 1.5 * cycle_length.
+    min_allowed_version: max_allowed_version - version_range_cycles * cycle_length.
+
+    `version_range_cycles` overrides `config.cycle.version_range_cycles` for
+    callers that want a tighter window (e.g. miner download — restricts the
+    pool to this-cycle validator commits so the stake-weighted majority
+    cannot be pulled toward an older hash by stale-but-staked validators).
 
     Both are derived from the owner phase service API.
     Returns (None, None) if the API is unavailable.
     """
+    cycles = version_range_cycles if version_range_cycles is not None else config.cycle.version_range_cycles
+
     current_phase = get_phase_from_api(config)
     if current_phase is not None and current_phase.phase_name == PhaseNames.miner_commit_1:
         max_version = current_phase.phase_start_block
         cycle_length = current_phase.cycle_length
-        min_version = max_version - int(cycle_length * config.cycle.version_range_cycles)
+        min_version = max_version - int(cycle_length * cycles)
         logger.debug(
             "get_allowed_version_range: currently in MinerCommit1",
             min_version=min_version, max_version=max_version, cycle_length=cycle_length,
+            version_range_cycles=cycles,
         )
         return min_version, max_version
 
@@ -744,10 +755,11 @@ def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | N
     # derive cycle_length as sum of all phase lengths
     cycle_length = sum((end - start + 1) for start, end in previous_ranges.values())
 
-    min_version = max_version - int(cycle_length * config.cycle.version_range_cycles)
+    min_version = max_version - int(cycle_length * cycles)
     logger.debug(
         "get_allowed_version_range",
         min_version=min_version, max_version=max_version, cycle_length=cycle_length,
+        version_range_cycles=cycles,
     )
     return min_version, max_version
 

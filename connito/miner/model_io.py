@@ -24,7 +24,12 @@ from connito.shared.checkpoints import (
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.config import MinerConfig, parse_args
 from connito.shared.chain import setup_chain_worker
-from connito.shared.cycle import PhaseResponse, check_phase_expired, wait_till
+from connito.shared.cycle import (
+    PhaseResponse,
+    check_phase_expired,
+    get_allowed_version_range,
+    wait_till,
+)
 from connito.shared.hf_distribute import (
     get_hf_upload_readiness,
     resolve_hf_repo_ids,
@@ -206,6 +211,15 @@ def _prepare_checkpoint_for_commit(
     )
     if latest_checkpoint is None or latest_checkpoint.path is None:
         raise FileNotReadyError("Not checkpoint found, skip commit.")
+
+    # Align the committed global_ver with the current cycle's
+    # max_allowed_version so this submission lands at the head of the
+    # validator-side version-range gate (and matches what merge-participant
+    # validators commit at validator_commit_2). Fall back to the inherited
+    # global_ver if the phase API is unreachable.
+    _, max_allowed_ver = get_allowed_version_range(config)
+    if max_allowed_ver is not None:
+        latest_checkpoint.global_ver = max_allowed_ver
 
     latest_checkpoint.expert_group = config.task.exp.group_id
     latest_checkpoint.sign_hash(wallet=wallet)

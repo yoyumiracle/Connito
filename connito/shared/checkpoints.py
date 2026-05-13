@@ -701,6 +701,7 @@ def build_chain_checkpoints_from_previous_phase(
     subtensor: bittensor.Subtensor,
     for_role: str = "validator",
     owner_hotkey: str | None = None,
+    version_range_cycles: int | None = None,
 ) -> ChainCheckpoints:
     logger.debug("Building chain checkpoints from previous phase", for_role=for_role)
     
@@ -771,7 +772,7 @@ def build_chain_checkpoints_from_previous_phase(
         )
 
     # --- Build chain checkpoints ---
-    min_ver, max_ver = get_allowed_version_range(config)
+    min_ver, max_ver = get_allowed_version_range(config, version_range_cycles=version_range_cycles)
     return build_chain_checkpoints(
         signed_hash_chain_commits=signed_hash_chain_commits,
         hash_chain_commits=hash_chain_commits,

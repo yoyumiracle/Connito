@@ -79,6 +79,7 @@ def test_miner_commit_cycle_never_issues_http_request_on_hf_success():
     fake_checkpoint.expert_group = 0
 
     with patch.object(model_io, "select_best_checkpoint", return_value=fake_checkpoint), \
+         patch.object(model_io, "get_allowed_version_range", return_value=(None, None)), \
          patch.object(model_io, "_commit_signed_model_hash") as commit_signed, \
          patch.object(model_io, "_commit_model_hash") as commit_hash, \
          patch.object(model_io, "_upload_checkpoint_to_hf_safe", return_value=("owner/repo", "abcdef0")) as hf_upload, \
