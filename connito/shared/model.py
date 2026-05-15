@@ -53,7 +53,6 @@ def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int
             # tolerates per-file `EntryNotFoundError` so requesting both is safe
             # when the repo only has one.
             targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.safetensors"))
-            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
         elif expert_group_id == "shared":
             # `model_shared` is no longer persisted or distributed; backbone state
             # is reconstructed from `config.model.model_path` at instantiation.
