@@ -47,6 +47,34 @@ configure_logging()
 logger = structlog.get_logger(__name__)
 
 
+def _is_retryable_chain_error(exc: BaseException) -> bool:
+    """Return True for transient RPC / websocket failures worth retrying."""
+    if isinstance(exc, TimeoutError):
+        return True
+
+    name = type(exc).__name__
+    msg = str(exc)
+    lowered = msg.lower()
+
+    if "ConnectionClosedError" in name:
+        return True
+
+    # Match common websocket / substrate transient failure signatures.
+    if any(
+        token in lowered
+        for token in (
+            "keepalive ping timeout",
+            "timed out while closing connection",
+            "connectionclosederror",
+            "websocket",
+            "internal error",
+        )
+    ):
+        return True
+
+    return False
+
+
 def _classify_upload_error(exc: BaseException) -> str:
     """Map an upload exception to a small set of `inc_error` kind labels.
 
@@ -156,14 +184,36 @@ def download_worker(
             if current_model_meta is not None:
                 current_model_meta.model_hash = current_model_hash
 
-            chain_checkpoint = fetch_model_from_chain_validator(
-                current_model_meta,
-                config,
-                subtensor,
-                wallet,
-                expert_group_ids=[config.task.exp.group_id],
-                expert_group_assignment = expert_manager.expert_group_assignment
-            )
+            chain_checkpoint = None
+            max_chain_fetch_retries = 2
+            for attempt in range(max_chain_fetch_retries + 1):
+                try:
+                    chain_checkpoint = fetch_model_from_chain_validator(
+                        current_model_meta,
+                        config,
+                        subtensor,
+                        wallet,
+                        expert_group_ids=[config.task.exp.group_id],
+                        expert_group_assignment=expert_manager.expert_group_assignment,
+                    )
+                    break
+                except Exception as fetch_exc:
+                    if attempt >= max_chain_fetch_retries or not _is_retryable_chain_error(fetch_exc):
+                        raise
+
+                    logger.warning(
+                        "<distribute> chain fetch failed; refreshing subtensor and retrying",
+                        attempt=attempt + 1,
+                        max_retries=max_chain_fetch_retries,
+                        error=str(fetch_exc),
+                    )
+                    try:
+                        subtensor = bittensor.Subtensor(config.chain.network)
+                    except Exception as refresh_exc:
+                        logger.warning(
+                            "<distribute> failed to refresh subtensor before retry",
+                            error=str(refresh_exc),
+                        )
 
             if (
                 chain_checkpoint is None
@@ -409,8 +459,10 @@ def commit_worker(
 
 # --- Wiring it all together ---
 def run_system(config, wallet, expert_manager, current_model_version: int = 0, current_model_hash: str = "xxx", subtensor=None):
-    if subtensor is None:
-        subtensor = bittensor.Subtensor(config.chain.network)
+    # Keep an optional `subtensor` arg for backwards compatibility, but do not
+    # share a single Subtensor across worker threads.
+    if subtensor is not None:
+        logger.warning("run_system: ignoring shared subtensor to avoid cross-thread websocket reuse")
 
     download_queue = Queue()
     commit_queue = Queue()
@@ -419,12 +471,12 @@ def run_system(config, wallet, expert_manager, current_model_version: int = 0, c
     # Non-daemon threads so they can be joined cleanly on shutdown.
     download_thread = Thread(
         target=download_worker,
-        args=(config, wallet, expert_manager, download_queue, current_model_version, current_model_hash, shared_state, subtensor),
+        args=(config, wallet, expert_manager, download_queue, current_model_version, current_model_hash, shared_state, None),
         daemon=False,
     )
     commit_thread = Thread(
         target=commit_worker,
-        args=(config, commit_queue, wallet, shared_state, subtensor),
+        args=(config, commit_queue, wallet, shared_state, None),
         daemon=False,
     )
 
