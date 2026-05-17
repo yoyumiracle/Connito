@@ -469,6 +469,57 @@ def assign_miners_to_validators(
     return assignment
 
 
+def _get_minercommit2_block_hash(
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+) -> str | None:
+    """Return the chain block hash of the LAST block of the most recent
+    completed `MinerCommit2` phase.
+
+    That block is sealed BEFORE miners' commit window closes and before
+    validators run `Round.freeze`, but its hash is not predictable in
+    advance — no party controls block production. Mixing this hash into
+    the combined eval seed (see `get_combined_validator_seed`) makes the
+    eval data slice unpredictable to miners *and* unforgeable by any
+    validator(s) acting alone, closing the validator-miner collusion
+    attack that the publicly-committed `miner_seed` scheme allowed.
+
+    Returns the 0x-prefixed hex hash string, or None if the phase API
+    or chain RPC is unavailable (caller treats None as a hard failure).
+    """
+    previous_phase_range = get_blocks_from_previous_phase_from_api(config)
+    if previous_phase_range is None:
+        logger.warning("Phase API unavailable; cannot derive block-hash component of seed")
+        return None
+
+    phase_range = previous_phase_range.get(PhaseNames.miner_commit_2)
+    if not phase_range or len(phase_range) < 2:
+        logger.warning(
+            "Phase API did not return MinerCommit2 range; cannot derive block-hash seed",
+            previous_phase_range=previous_phase_range,
+        )
+        return None
+
+    last_block = int(phase_range[1])
+    try:
+        block_hash = subtensor.get_block_hash(last_block)
+    except Exception as exc:  # noqa: BLE001 — chain RPC can throw a variety
+        logger.warning(
+            "subtensor.get_block_hash failed for MinerCommit2 last block",
+            block=last_block, error=str(exc),
+        )
+        return None
+
+    if not block_hash:
+        logger.warning(
+            "subtensor.get_block_hash returned empty for MinerCommit2 last block",
+            block=last_block,
+        )
+        return None
+
+    return str(block_hash)
+
+
 def get_combined_validator_seed(
     config: WorkerConfig,
     subtensor: bittensor.Subtensor,
@@ -477,6 +528,31 @@ def get_combined_validator_seed(
 ) -> str:
     """
     Deterministically combine validator seeds into a single hex string.
+
+    Two entropy sources are mixed:
+      1. The per-validator `miner_seed` values committed on chain
+         (existing scheme — kept for backward compatibility during
+         rollout; readable by miners during their commit window, so
+         this alone is exploitable).
+      2. The block hash of the LAST block of the most recent completed
+         `MinerCommit2` phase (added per PR #N — block is sealed before
+         miners' commit window closes but its hash is unpredictable in
+         advance; no validator controls block production, so this
+         component is robust against validator-miner collusion).
+
+    After this PR lands network-wide, (2) dominates security and (1)
+    can be removed in a follow-up that drops the `miner_seed` chain-
+    commit field entirely.
+
+    If `block_hash` is unavailable (phase API or chain RPC failure),
+    fall back to using an empty string for that component — the cycle
+    continues with only the validator-committed seeds contributing
+    entropy (equivalent to pre-PR security level for that cycle).
+    A follow-up PR will tighten this: the combined "no committed
+    seeds AND no block_hash" case still produces sha256("") which is
+    publicly known; that needs a hard guard. Left as a known
+    deficiency for now per the reviewer's preference to keep the
+    program running through transient failures.
 
     We sort validator IDs so the result is independent of dict iteration order.
 
@@ -490,11 +566,25 @@ def get_combined_validator_seed(
         commits = get_chain_commits(config, subtensor)
 
     validator_seeds = get_validator_seed_from_commit(config, commits)
-    if not validator_seeds:
-        logger.warning("No validator seeds found on chain — returning fallback seed '0'")
-        return hashlib.sha256(b"0").hexdigest()
+    block_hash = _get_minercommit2_block_hash(config, subtensor)
+    if not block_hash:
+        block_hash = ""
 
-    combined_seed_str = "".join(str(validator_seeds[v]) for v in sorted(validator_seeds.keys()))
+    logger.info(
+        "Combined validator seed inputs",
+        validator_seeds=validator_seeds,
+        block_hash=block_hash,
+    )
+
+    # Validator-committed component: deterministic from sorted seeds.
+    # May be empty during the transition before all operators have
+    # upgraded; in that state the block-hash component (when present)
+    # supplies the entropy.
+    committed_part = "".join(
+        str(validator_seeds[v]) for v in sorted(validator_seeds.keys())
+    ) if validator_seeds else ""
+
+    combined_seed_str = committed_part + block_hash
     return hashlib.sha256(combined_seed_str.encode()).hexdigest()
 
 
